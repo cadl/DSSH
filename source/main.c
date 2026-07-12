@@ -752,10 +752,9 @@ int main(int argc, char *argv[]) {
     tailscale_debug_set_runtime(&tailscale_debug);
     tailscale_debug_flush(&tailscale_debug, term);
 
-    /* Keychain bootstrap is only needed for the initial session. The SSH key
-     * passphrase remains until cleanup because SELECT reconnect may need it. */
-    clear_secret(cfg.macos_keychain_password,
-                 sizeof(cfg.macos_keychain_password));
+    /* A fresh SSH login may see the macOS login keychain as locked even when
+     * the previous session unlocked it. Keep both credentials until cleanup
+     * so wake/SELECT reconnects can authenticate and bootstrap keychain again. */
 
 idle_loop:
     {
