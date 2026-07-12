@@ -499,11 +499,16 @@ static void send_to_ssh(ssh_client_t *ssh, terminal_t *term,
  * Used both for the initial connect at startup and for the SELECT-key
  * reconnect after a hard disconnect (lid-close sleep kills the TCP).
  * On success: returns a new ssh_client_t, resets/sizes the PTY, performs the
- * one-time keychain bootstrap when a password is still present, and writes a
+ * keychain bootstrap when a password is configured, and writes a
  * status string. On failure: returns NULL and writes the SSH diagnostic. */
 static ssh_client_t *reconnect_ssh(const ssh_config_t *cfg,
                                    ts3ds *tailscale,
                                    terminal_t *term,
+                                   C3D_RenderTarget *top,
+                                   C3D_RenderTarget *bot,
+                                   renderer_t *renderer,
+                                   softkb_t *soft_keyboard,
+                                   keyboard_t *physical_keyboard,
                                    char *status_buf, int status_sz,
                                    char *err, int err_sz) {
     ssh_client_t *ssh = ssh_connect_pubkey(
@@ -530,6 +535,15 @@ static ssh_client_t *reconnect_ssh(const ssh_config_t *cfg,
              cfg->host, cfg->port);
 
     if (cfg->macos_keychain_password[0]) {
+        /* Render the status before the synchronous bootstrap blocks. Reset
+         * again afterwards so this local-only line cannot affect fish's CPR
+         * replies or the remote PTY coordinate system. */
+        terminal_write(term,
+            "\x1b[36mUnlocking macOS keychain...\x1b[0m\r\n");
+        render_connecting_frame(top, bot, renderer, term,
+                                soft_keyboard, physical_keyboard);
+        terminal_reset(term);
+
         keychain_report_t report = { -1, -1 };
         int unlock_rc = unlock_macos_keychain(
             ssh, term, cfg->macos_keychain_password, &report, err, err_sz);
@@ -744,7 +758,7 @@ int main(int argc, char *argv[]) {
      * the SSH handshake blocks the main loop. */
     render_connecting_frame(top, bot, r, term, kb, kbd);
 
-    ssh = reconnect_ssh(&cfg, tailscale, term,
+    ssh = reconnect_ssh(&cfg, tailscale, term, top, bot, r, kb, kbd,
                         status_buf, sizeof(status_buf),
                         err, sizeof(err));
     status_color = ssh ? COLOR_OK : COLOR_ERR;
@@ -819,6 +833,7 @@ idle_loop:
                 osGetTime() >= wake_reconnect_at) {
                 wake_reconnect_attempts++;
                 ssh = reconnect_ssh(&cfg, tailscale, term,
+                                    top, bot, r, kb, kbd,
                                     status_buf, sizeof(status_buf),
                                     err, sizeof(err));
                 if (ssh) {
@@ -1021,6 +1036,7 @@ idle_loop:
                 }
                 C3D_FrameEnd(0);
                 ssh = reconnect_ssh(&cfg, tailscale, term,
+                                    top, bot, r, kb, kbd,
                                     status_buf, sizeof(status_buf),
                                     err, sizeof(err));
                 mascot_set_reconnecting(mc, 0);
