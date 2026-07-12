@@ -24,14 +24,23 @@
 #include <malloc.h>
 #include <3ds.h>
 #include <citro2d.h>
+#include <ts3ds.h>
 
 #include "ssh_client.h"
 #include "config.h"
+#include "keychain_protocol.h"
 #include "terminal.h"
 #include "renderer.h"
 #include "keyboard.h"
 #include "softkb.h"
 #include "mascot.h"
+
+#ifndef DSSH_TAILSCALE_PATH
+#define DSSH_TAILSCALE_PATH "auto"
+#endif
+#ifndef DSSH_TAILSCALE_VERBOSE
+#define DSSH_TAILSCALE_VERBOSE 0
+#endif
 #include "ime_pinyin.h"
 #include "voice.h"
 #include "ai_modal.h"
@@ -56,6 +65,111 @@
 #define COLOR_ACCENT    0x89b4faff
 
 static u32 *soc_buf = NULL;
+
+/* APT hooks may run while the main loop is suspended. Keep the callback
+ * side minimal and let the next active frame own all SSH/Tailscale work. */
+static volatile int g_sleep_seen = 0;
+static volatile int g_wakeup_pending = 0;
+
+static void apt_event_hook(APT_HookType hook, void *param) {
+    (void)param;
+    if (hook == APTHOOK_ONSLEEP) {
+        g_sleep_seen = 1;
+    } else if (hook == APTHOOK_ONWAKEUP && g_sleep_seen) {
+        g_sleep_seen = 0;
+        g_wakeup_pending = 1;
+    }
+}
+
+#define TS_DEBUG_LINE_COUNT 24
+#define TS_DEBUG_LINE_SIZE  224
+
+typedef struct tailscale_debug_log {
+    LightLock lock;
+    char lines[TS_DEBUG_LINE_COUNT][TS_DEBUG_LINE_SIZE];
+    unsigned char levels[TS_DEBUG_LINE_COUNT];
+    unsigned head;
+    unsigned count;
+    unsigned dropped;
+    int startup_verbose;
+} tailscale_debug_log;
+
+static void tailscale_debug_init(tailscale_debug_log *debug) {
+    memset(debug, 0, sizeof(*debug));
+    LightLock_Init(&debug->lock);
+    debug->startup_verbose = DSSH_TAILSCALE_VERBOSE ? 1 : 0;
+}
+
+/* libts3ds may log from its DERP worker. Keep that callback independent of
+ * terminal rendering, then drain it from DSSH's main thread. */
+static void tailscale_debug_capture(void *userdata, int level,
+                                    const char *message) {
+    tailscale_debug_log *debug = (tailscale_debug_log *)userdata;
+    if (!debug || !message) return;
+    LightLock_Lock(&debug->lock);
+    /* Keep rich diagnostics while Tailscale and SSH are connecting. Once an
+     * interactive shell exists, control/DERP maintenance is independent of
+     * the established WireGuard data path and must never corrupt the user's
+     * command line. SSH failure still has its own visible connection state. */
+    if (level >= 3 || !debug->startup_verbose) {
+        LightLock_Unlock(&debug->lock);
+        return;
+    }
+    if (debug->count == TS_DEBUG_LINE_COUNT) {
+        debug->head = (debug->head + 1) % TS_DEBUG_LINE_COUNT;
+        debug->count--;
+        debug->dropped++;
+    }
+    unsigned slot = (debug->head + debug->count) % TS_DEBUG_LINE_COUNT;
+    snprintf(debug->lines[slot], TS_DEBUG_LINE_SIZE, "%s", message);
+    debug->levels[slot] = (unsigned char)level;
+    debug->count++;
+    LightLock_Unlock(&debug->lock);
+}
+
+static void tailscale_debug_set_runtime(tailscale_debug_log *debug) {
+    if (!debug) return;
+    LightLock_Lock(&debug->lock);
+    debug->startup_verbose = 0;
+    LightLock_Unlock(&debug->lock);
+}
+
+static void tailscale_debug_flush(tailscale_debug_log *debug,
+                                  terminal_t *term) {
+    if (!debug || !term) return;
+    for (;;) {
+        char message[TS_DEBUG_LINE_SIZE];
+        unsigned level;
+        unsigned dropped = 0;
+        LightLock_Lock(&debug->lock);
+        if (debug->count == 0) {
+            dropped = debug->dropped;
+            debug->dropped = 0;
+            LightLock_Unlock(&debug->lock);
+            if (dropped) {
+                char line[96];
+                snprintf(line, sizeof(line),
+                         "\x1b[33m[ts3ds] %u earlier log lines dropped"
+                         "\x1b[0m\r\n", dropped);
+                terminal_write(term, line);
+            }
+            return;
+        }
+        unsigned slot = debug->head;
+        snprintf(message, sizeof(message), "%s", debug->lines[slot]);
+        level = debug->levels[slot];
+        debug->head = (debug->head + 1) % TS_DEBUG_LINE_COUNT;
+        debug->count--;
+        LightLock_Unlock(&debug->lock);
+
+        char line[TS_DEBUG_LINE_SIZE + 40];
+        const char *color = level == 0 ? "\x1b[31m"
+                            : level == 1 ? "\x1b[33m" : "\x1b[90m";
+        snprintf(line, sizeof(line), "%s[ts3ds] %s\x1b[0m\r\n",
+                 color, message);
+        terminal_write(term, line);
+    }
+}
 
 static int net_init(char *err, int err_sz) {
     soc_buf = (u32 *)memalign(SOC_ALIGN, SOC_BUFFERSIZE);
@@ -128,6 +242,7 @@ static int startup_write_all(ssh_client_t *ssh, const char *data, int len,
     int sent = 0;
     u64 deadline = osGetTime() + (u64)timeout_ms;
     while (sent < len && osGetTime() < deadline) {
+        ssh_poll_transport(ssh);
         int n = ssh_write(ssh, data + sent, len - sent);
         if (n < 0) return -1;
         if (n == 0) {
@@ -172,6 +287,10 @@ static int wait_for_remote_text_any(ssh_client_t *ssh, terminal_t *term,
     u64 deadline = osGetTime() + (u64)timeout_ms;
 
     while (osGetTime() < deadline) {
+        /* A Tailscale-backed SSH socket lives in libts3ds's private lwIP
+         * stack. It cannot progress while this synchronous bootstrap loop
+         * sleeps unless its transport is explicitly pumped. */
+        ssh_poll_transport(ssh);
         int n = ssh_read(ssh, raw, sizeof(raw));
         if (n < 0) return -1;
         if (n == 0) {
@@ -252,7 +371,7 @@ static int unlock_macos_keychain(ssh_client_t *ssh, terminal_t *term,
         "if [ \"$u\" -ne 0 ] || [ \"$v\" -ne 0 ]; then "
         "printf \"[keychain] unlock failed (unlock=%d verify=%d)\\n\" "
         "\"$u\" \"$v\"; fi'\n";
-    static const char result_marker[] = "DSSH_KEYCHAIN_RESULT";
+    static const char result_marker[] = DSSH_KEYCHAIN_RESULT_MARKER;
     char capture[768];
 
     report->unlock_status = -1;
@@ -347,6 +466,21 @@ static void clear_secret(char *s, size_t len) {
     while (len-- > 0) *p++ = 0;
 }
 
+static void render_connecting_frame(C3D_RenderTarget *top,
+                                    C3D_RenderTarget *bot,
+                                    renderer_t *renderer, terminal_t *term,
+                                    softkb_t *keyboard,
+                                    keyboard_t *physical_keyboard) {
+    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    C2D_TargetClear(top, C2D_Color32(0x1a, 0x1b, 0x26, 0xff));
+    C2D_SceneBegin(top);
+    renderer_draw_terminal(renderer, term);
+    C2D_TargetClear(bot, C2D_Color32(0x18, 0x18, 0x25, 0xff));
+    C2D_SceneBegin(bot);
+    softkb_draw(keyboard, renderer, physical_keyboard);
+    C3D_FrameEnd(0);
+}
+
 /* Snap the local terminal view to the bottom (canceling any user-side
  * scrollback peek) right before sending a key.  This way the user always
  * sees what they just typed, even if they were glancing at history. */
@@ -365,10 +499,16 @@ static void send_to_ssh(ssh_client_t *ssh, terminal_t *term,
  * Used both for the initial connect at startup and for the SELECT-key
  * reconnect after a hard disconnect (lid-close sleep kills the TCP).
  * On success: returns a new ssh_client_t, resets/sizes the PTY, performs the
- * one-time keychain bootstrap when a password is still present, and writes a
+ * keychain bootstrap when a password is configured, and writes a
  * status string. On failure: returns NULL and writes the SSH diagnostic. */
 static ssh_client_t *reconnect_ssh(const ssh_config_t *cfg,
+                                   ts3ds *tailscale,
                                    terminal_t *term,
+                                   C3D_RenderTarget *top,
+                                   C3D_RenderTarget *bot,
+                                   renderer_t *renderer,
+                                   softkb_t *soft_keyboard,
+                                   keyboard_t *physical_keyboard,
                                    char *status_buf, int status_sz,
                                    char *err, int err_sz) {
     ssh_client_t *ssh = ssh_connect_pubkey(
@@ -376,6 +516,7 @@ static ssh_client_t *reconnect_ssh(const ssh_config_t *cfg,
         cfg->key_path, NULL,
         cfg->passphrase[0] ? cfg->passphrase : NULL,
         R_TOP_COLS, R_TOP_ROWS,
+        tailscale,
         err, err_sz);
 
     if (!ssh) {
@@ -394,6 +535,15 @@ static ssh_client_t *reconnect_ssh(const ssh_config_t *cfg,
              cfg->host, cfg->port);
 
     if (cfg->macos_keychain_password[0]) {
+        /* Render the status before the synchronous bootstrap blocks. Reset
+         * again afterwards so this local-only line cannot affect fish's CPR
+         * replies or the remote PTY coordinate system. */
+        terminal_write(term,
+            "\x1b[36mUnlocking macOS keychain...\x1b[0m\r\n");
+        render_connecting_frame(top, bot, renderer, term,
+                                soft_keyboard, physical_keyboard);
+        terminal_reset(term);
+
         keychain_report_t report = { -1, -1 };
         int unlock_rc = unlock_macos_keychain(
             ssh, term, cfg->macos_keychain_password, &report, err, err_sz);
@@ -434,12 +584,17 @@ int main(int argc, char *argv[]) {
     char status_buf[80] = "starting...";
     uint32_t status_color = COLOR_WARN;
     ssh_client_t *ssh = NULL;
+    ts3ds *tailscale = NULL;
+    static tailscale_debug_log tailscale_debug;
+    tailscale_debug_init(&tailscale_debug);
 
     /* ── Graphics init (audio disabled — see audio.{c,h} kept for future) ── */
     gfxInitDefault();
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
     C2D_Init(32768);
     C2D_Prepare();
+    aptHookCookie apt_hook_cookie;
+    aptHook(&apt_hook_cookie, apt_event_hook, NULL);
     C3D_RenderTarget *top = C2D_CreateScreenTarget(GFX_TOP,    GFX_LEFT);
     C3D_RenderTarget *bot = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
 
@@ -498,19 +653,85 @@ int main(int argc, char *argv[]) {
         terminal_write(term, "\x1b[33mromfs init failed — IME unavailable\x1b[0m\r\n");
     }
 
+    if (config_tailscale_should_start(&cfg)) {
+        ts3ds_config tailscale_config;
+        ts3ds_config_init(&tailscale_config);
+        tailscale_config.auth_key = cfg.tailscale_auth_key[0]
+                                        ? cfg.tailscale_auth_key : NULL;
+        tailscale_config.hostname = cfg.tailscale_hostname;
+        tailscale_config.state_path = cfg.tailscale_state;
+        tailscale_config.control_url = cfg.tailscale_control_url;
+        if (ts3ds_path_policy_parse(DSSH_TAILSCALE_PATH,
+                                    &tailscale_config.path_policy) !=
+            TS3DS_OK) {
+            char line[192];
+            snprintf(line, sizeof(line),
+                     "\x1b[31mTailscale build error:\x1b[0m invalid "
+                     "path policy='%.64s' (use auto, direct, "
+                     "peer-relay, or derp)\r\n",
+                     DSSH_TAILSCALE_PATH);
+            terminal_write(term, line);
+            snprintf(status_buf, sizeof(status_buf), "tailscale build err");
+            status_color = COLOR_ERR;
+            goto idle_loop;
+        }
+        if (DSSH_TAILSCALE_VERBOSE) {
+            tailscale_config.log = tailscale_debug_capture;
+            tailscale_config.log_userdata = &tailscale_debug;
+        }
+        terminal_write(term,
+                       "\x1b[36mConnecting to Tailscale...\x1b[0m\r\n");
+        if (DSSH_TAILSCALE_VERBOSE) {
+            char line[256];
+            snprintf(line, sizeof(line),
+                     "  node=%.63s auth=%s path=%.16s state=%.96s"
+                     "\r\n",
+                     cfg.tailscale_hostname,
+                     cfg.tailscale_auth_key[0] ? "yes" : "no",
+                     ts3ds_path_policy_name(tailscale_config.path_policy),
+                     cfg.tailscale_state);
+            terminal_write(term, line);
+        }
+        render_connecting_frame(top, bot, r, term, kb, kbd);
+        tailscale = ts3ds_new(&tailscale_config);
+        int tailscale_result = tailscale ? ts3ds_up(tailscale)
+                                         : TS3DS_ERR_ARGUMENT;
+        memset(cfg.tailscale_auth_key, 0,
+               sizeof(cfg.tailscale_auth_key));
+        tailscale_debug_flush(&tailscale_debug, term);
+        if (!tailscale || tailscale_result != TS3DS_OK) {
+            const char *reason = tailscale
+                                     ? ts3ds_last_error(tailscale)
+                                     : "invalid Tailscale configuration";
+            char line[256];
+            snprintf(line, sizeof(line),
+                     "\x1b[31mTailscale error rc=%d status=%d:\x1b[0m "
+                     "%.170s\r\n", tailscale_result,
+                     tailscale ? (int)ts3ds_get_status(tailscale) : -1,
+                     reason);
+            terminal_write(term, line);
+            snprintf(status_buf, sizeof(status_buf), "tailscale err");
+            status_color = COLOR_ERR;
+            tailscale_debug_set_runtime(&tailscale_debug);
+            goto idle_loop;
+        }
+        {
+            uint32_t ip = ts3ds_get_ipv4(tailscale);
+            char line[96];
+            snprintf(line, sizeof(line),
+                     "\x1b[32mTailscale online:\x1b[0m %u.%u.%u.%u\r\n",
+                     (unsigned)((ip >> 24) & 0xff),
+                     (unsigned)((ip >> 16) & 0xff),
+                     (unsigned)((ip >> 8) & 0xff),
+                     (unsigned)(ip & 0xff));
+            terminal_write(term, line);
+        }
+    }
+
     /* Pump one frame so the user sees the loading banner during the
      * (synchronous, ~5s) dict read.  The bottom screen still has the
      * keyboard rendered — the badge and mascot work normally. */
-    {
-        C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-        C2D_TargetClear(top, C2D_Color32(0x1a, 0x1b, 0x26, 0xff));
-        C2D_SceneBegin(top);
-        renderer_draw_terminal(r, term);
-        C2D_TargetClear(bot, C2D_Color32(0x18, 0x18, 0x25, 0xff));
-        C2D_SceneBegin(bot);
-        softkb_draw(kb, r, kbd);
-        C3D_FrameEnd(0);
-    }
+    render_connecting_frame(top, bot, r, term, kb, kbd);
 
     /* Load the pinyin dict (~9 MB).  Failure here is non-fatal — we
      * just leave ime NULL and softkb degrades CN mode to passthrough. */
@@ -535,25 +756,19 @@ int main(int argc, char *argv[]) {
 
     /* Pump again so the user sees the loaded/connecting banners before
      * the SSH handshake blocks the main loop. */
-    {
-        C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-        C2D_TargetClear(top, C2D_Color32(0x1a, 0x1b, 0x26, 0xff));
-        C2D_SceneBegin(top);
-        renderer_draw_terminal(r, term);
-        C2D_TargetClear(bot, C2D_Color32(0x18, 0x18, 0x25, 0xff));
-        C2D_SceneBegin(bot);
-        softkb_draw(kb, r, kbd);
-        C3D_FrameEnd(0);
-    }
+    render_connecting_frame(top, bot, r, term, kb, kbd);
 
-    ssh = reconnect_ssh(&cfg, term, status_buf, sizeof(status_buf),
+    ssh = reconnect_ssh(&cfg, tailscale, term, top, bot, r, kb, kbd,
+                        status_buf, sizeof(status_buf),
                         err, sizeof(err));
     status_color = ssh ? COLOR_OK : COLOR_ERR;
 
-    /* Keychain bootstrap is only needed for the initial session. The SSH key
-     * passphrase remains until cleanup because SELECT reconnect may need it. */
-    clear_secret(cfg.macos_keychain_password,
-                 sizeof(cfg.macos_keychain_password));
+    tailscale_debug_set_runtime(&tailscale_debug);
+    tailscale_debug_flush(&tailscale_debug, term);
+
+    /* A fresh SSH login may see the macOS login keychain as locked even when
+     * the previous session unlocked it. Keep both credentials until cleanup
+     * so wake/SELECT reconnects can authenticate and bootstrap keychain again. */
 
 idle_loop:
     {
@@ -576,8 +791,73 @@ idle_loop:
         g_last_tx_at      = last_rx_at;
         int    stall_alert = 0;
         int    ssh_dead    = ssh ? 0 : 1;
+        int    wake_reconnect_pending = 0;
+        int    wake_reconnect_attempts = 0;
+        u64    wake_reconnect_at = 0;
 
         while (aptMainLoop()) {
+            if (g_wakeup_pending) {
+                g_wakeup_pending = 0;
+
+                /* Wi-Fi sleep often leaves libssh2/lwIP returning EAGAIN
+                 * forever instead of a hard error. The old TCP flow cannot
+                 * be trusted after wake, even if its connected flag is set. */
+                if (ssh) {
+                    voice_abort(voice);
+                    ssh_disconnect(ssh);
+                    ssh = NULL;
+                }
+                ssh_dead = 1;
+                stall_alert = 1;
+                mascot_set_alert(mc, 1);
+                mascot_set_reconnecting(mc, 1);
+                terminal_write(term,
+                    "\r\n\x1b[33mWoke from sleep; reconnecting..."
+                    "\x1b[0m\r\n");
+                render_connecting_frame(top, bot, r, term, kb, kbd);
+
+                /* Give the 3DS Wi-Fi stack and libts3ds a short window to
+                 * process wakeup before opening a fresh TCP/SSH flow. */
+                wake_reconnect_pending = 1;
+                wake_reconnect_attempts = 0;
+                wake_reconnect_at = osGetTime() + 1500;
+                g_last_tx_at = last_rx_at = time(NULL);
+            }
+
+            if (tailscale && ts3ds_get_status(tailscale) ==
+                                 TS3DS_STATUS_ONLINE)
+                ts3ds_poll(tailscale);
+            tailscale_debug_flush(&tailscale_debug, term);
+
+            if (wake_reconnect_pending &&
+                osGetTime() >= wake_reconnect_at) {
+                wake_reconnect_attempts++;
+                ssh = reconnect_ssh(&cfg, tailscale, term,
+                                    top, bot, r, kb, kbd,
+                                    status_buf, sizeof(status_buf),
+                                    err, sizeof(err));
+                if (ssh) {
+                    wake_reconnect_pending = 0;
+                    ssh_dead = 0;
+                    stall_alert = 0;
+                    mascot_set_alert(mc, 0);
+                    mascot_set_reconnecting(mc, 0);
+                    mascot_celebrate(mc);
+                    g_last_tx_at = last_rx_at = time(NULL);
+                } else if (wake_reconnect_attempts < 3) {
+                    terminal_write(term,
+                        "\x1b[33mWake reconnect retrying...\x1b[0m\r\n");
+                    wake_reconnect_at = osGetTime() + 3000;
+                } else {
+                    wake_reconnect_pending = 0;
+                    mascot_set_reconnecting(mc, 0);
+                    mascot_sadden(mc);
+                    terminal_write(term,
+                        "\x1b[31mWake reconnect failed; "
+                        "press SELECT to retry.\x1b[0m\r\n");
+                }
+            }
+
             hidScanInput();
             u32 down = hidKeysDown();
             u32 held = hidKeysHeld();
@@ -670,6 +950,7 @@ idle_loop:
                      * and how to recover (SELECT reconnect).  This only
                      * fires on the 0→1 transition of ssh_dead, so it
                      * won't spam the terminal every frame. */
+                    voice_abort(voice);
                     ssh_disconnect(ssh);
                     ssh = NULL;
                     ssh_dead = 1;
@@ -719,6 +1000,7 @@ idle_loop:
             int select_consumed = 0;
             if (ssh_dead && !modal_open && (down & KEY_SELECT)) {
                 select_consumed = 1;
+                wake_reconnect_pending = 0;
                 terminal_write(term,
                     "\x1b[33mReconnecting...\x1b[0m\r\n");
                 /* Put the crab into its "looking up / waiting" pose before
@@ -753,7 +1035,9 @@ idle_loop:
                     if (softkb_mascot_enabled(kb)) mascot_draw(mc);
                 }
                 C3D_FrameEnd(0);
-                ssh = reconnect_ssh(&cfg, term, status_buf, sizeof(status_buf),
+                ssh = reconnect_ssh(&cfg, tailscale, term,
+                                    top, bot, r, kb, kbd,
+                                    status_buf, sizeof(status_buf),
                                     err, sizeof(err));
                 mascot_set_reconnecting(mc, 0);
                 if (ssh) {
@@ -867,12 +1151,24 @@ idle_loop:
 
         if (ssh) ssh_disconnect(ssh);
     }
+    if (tailscale) {
+        ts3ds_close(tailscale);
+        tailscale = NULL;
+        tailscale_debug_flush(&tailscale_debug, term);
+    }
     net_fini();
 
 cleanup:
+    if (tailscale) {
+        ts3ds_close(tailscale);
+        tailscale = NULL;
+        tailscale_debug_flush(&tailscale_debug, term);
+    }
     clear_secret(cfg.passphrase, sizeof(cfg.passphrase));
     clear_secret(cfg.macos_keychain_password,
                  sizeof(cfg.macos_keychain_password));
+    clear_secret(cfg.tailscale_auth_key,
+                 sizeof(cfg.tailscale_auth_key));
     if (aim)   ai_modal_free(aim);
     if (voice) voice_free(voice);
     if (ime)  ime_free(ime);
@@ -882,6 +1178,7 @@ cleanup:
     if (r)    renderer_free(r);
     if (term) terminal_free(term);
     if (romfs_ok) romfsExit();
+    aptUnhook(&apt_hook_cookie);
     C2D_Fini();
     C3D_Fini();
     gfxExit();
