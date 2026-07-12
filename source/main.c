@@ -66,6 +66,21 @@
 
 static u32 *soc_buf = NULL;
 
+/* APT hooks may run while the main loop is suspended. Keep the callback
+ * side minimal and let the next active frame own all SSH/Tailscale work. */
+static volatile int g_sleep_seen = 0;
+static volatile int g_wakeup_pending = 0;
+
+static void apt_event_hook(APT_HookType hook, void *param) {
+    (void)param;
+    if (hook == APTHOOK_ONSLEEP) {
+        g_sleep_seen = 1;
+    } else if (hook == APTHOOK_ONWAKEUP && g_sleep_seen) {
+        g_sleep_seen = 0;
+        g_wakeup_pending = 1;
+    }
+}
+
 #define TS_DEBUG_LINE_COUNT 24
 #define TS_DEBUG_LINE_SIZE  224
 
@@ -564,6 +579,8 @@ int main(int argc, char *argv[]) {
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
     C2D_Init(32768);
     C2D_Prepare();
+    aptHookCookie apt_hook_cookie;
+    aptHook(&apt_hook_cookie, apt_event_hook, NULL);
     C3D_RenderTarget *top = C2D_CreateScreenTarget(GFX_TOP,    GFX_LEFT);
     C3D_RenderTarget *bot = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
 
@@ -761,12 +778,72 @@ idle_loop:
         g_last_tx_at      = last_rx_at;
         int    stall_alert = 0;
         int    ssh_dead    = ssh ? 0 : 1;
+        int    wake_reconnect_pending = 0;
+        int    wake_reconnect_attempts = 0;
+        u64    wake_reconnect_at = 0;
 
         while (aptMainLoop()) {
+            if (g_wakeup_pending) {
+                g_wakeup_pending = 0;
+
+                /* Wi-Fi sleep often leaves libssh2/lwIP returning EAGAIN
+                 * forever instead of a hard error. The old TCP flow cannot
+                 * be trusted after wake, even if its connected flag is set. */
+                if (ssh) {
+                    voice_abort(voice);
+                    ssh_disconnect(ssh);
+                    ssh = NULL;
+                }
+                ssh_dead = 1;
+                stall_alert = 1;
+                mascot_set_alert(mc, 1);
+                mascot_set_reconnecting(mc, 1);
+                terminal_write(term,
+                    "\r\n\x1b[33mWoke from sleep; reconnecting..."
+                    "\x1b[0m\r\n");
+                render_connecting_frame(top, bot, r, term, kb, kbd);
+
+                /* Give the 3DS Wi-Fi stack and libts3ds a short window to
+                 * process wakeup before opening a fresh TCP/SSH flow. */
+                wake_reconnect_pending = 1;
+                wake_reconnect_attempts = 0;
+                wake_reconnect_at = osGetTime() + 1500;
+                g_last_tx_at = last_rx_at = time(NULL);
+            }
+
             if (tailscale && ts3ds_get_status(tailscale) ==
                                  TS3DS_STATUS_ONLINE)
                 ts3ds_poll(tailscale);
             tailscale_debug_flush(&tailscale_debug, term);
+
+            if (wake_reconnect_pending &&
+                osGetTime() >= wake_reconnect_at) {
+                wake_reconnect_attempts++;
+                ssh = reconnect_ssh(&cfg, tailscale, term,
+                                    status_buf, sizeof(status_buf),
+                                    err, sizeof(err));
+                if (ssh) {
+                    wake_reconnect_pending = 0;
+                    ssh_dead = 0;
+                    stall_alert = 0;
+                    mascot_set_alert(mc, 0);
+                    mascot_set_reconnecting(mc, 0);
+                    mascot_celebrate(mc);
+                    g_last_tx_at = last_rx_at = time(NULL);
+                } else if (wake_reconnect_attempts < 3) {
+                    terminal_write(term,
+                        "\x1b[33mWake reconnect retrying...\x1b[0m\r\n");
+                    wake_reconnect_at = osGetTime() + 3000;
+                } else {
+                    wake_reconnect_pending = 0;
+                    mascot_set_reconnecting(mc, 0);
+                    mascot_sadden(mc);
+                    terminal_write(term,
+                        "\x1b[31mWake reconnect failed; "
+                        "press SELECT to retry.\x1b[0m\r\n");
+                }
+            }
+
             hidScanInput();
             u32 down = hidKeysDown();
             u32 held = hidKeysHeld();
@@ -859,6 +936,7 @@ idle_loop:
                      * and how to recover (SELECT reconnect).  This only
                      * fires on the 0→1 transition of ssh_dead, so it
                      * won't spam the terminal every frame. */
+                    voice_abort(voice);
                     ssh_disconnect(ssh);
                     ssh = NULL;
                     ssh_dead = 1;
@@ -908,6 +986,7 @@ idle_loop:
             int select_consumed = 0;
             if (ssh_dead && !modal_open && (down & KEY_SELECT)) {
                 select_consumed = 1;
+                wake_reconnect_pending = 0;
                 terminal_write(term,
                     "\x1b[33mReconnecting...\x1b[0m\r\n");
                 /* Put the crab into its "looking up / waiting" pose before
@@ -1084,6 +1163,7 @@ cleanup:
     if (r)    renderer_free(r);
     if (term) terminal_free(term);
     if (romfs_ok) romfsExit();
+    aptUnhook(&apt_hook_cookie);
     C2D_Fini();
     C3D_Fini();
     gfxExit();
